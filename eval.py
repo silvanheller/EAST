@@ -4,6 +4,7 @@ import math
 import os
 import numpy as np
 import tensorflow as tf
+from tensorflow.python.saved_model import tag_constants
 
 import locality_aware_nms as nms_locality
 import lanms
@@ -16,6 +17,8 @@ tf.app.flags.DEFINE_bool('no_write_images', False, 'do not write images')
 
 import model
 from icdar import restore_rectangle
+from tensorflow import saved_model as sm
+
 
 FLAGS = tf.app.flags.FLAGS
 
@@ -126,7 +129,6 @@ def main(argv=None):
     import os
     os.environ['CUDA_VISIBLE_DEVICES'] = FLAGS.gpu_list
 
-
     try:
         os.makedirs(FLAGS.output_dir)
     except OSError as e:
@@ -135,6 +137,7 @@ def main(argv=None):
 
     with tf.get_default_graph().as_default():
         input_images = tf.placeholder(tf.float32, shape=[None, None, None, 3], name='input_images')
+
         global_step = tf.get_variable('global_step', [], initializer=tf.constant_initializer(0), trainable=False)
 
         f_score, f_geometry = model.model(input_images, is_training=False)
@@ -142,12 +145,15 @@ def main(argv=None):
         variable_averages = tf.train.ExponentialMovingAverage(0.997, global_step)
         saver = tf.train.Saver(variable_averages.variables_to_restore())
 
+        #Traditional, save model
         with tf.Session(config=tf.ConfigProto(allow_soft_placement=True)) as sess:
             ckpt_state = tf.train.get_checkpoint_state(FLAGS.checkpoint_path)
             model_path = os.path.join(FLAGS.checkpoint_path, os.path.basename(ckpt_state.model_checkpoint_path))
             print('Restore from {}'.format(model_path))
             saver.restore(sess, model_path)
-
+            print('Saving model')
+            #sm.simple_save(sess, 'export/', inputs={'input_images': input_images}, outputs={"f_score": f_score, "f_geometry": f_geometry})
+            print('model saved')
             im_fn_list = get_images()
             for im_fn in im_fn_list:
                 im = cv2.imread(im_fn)[:, :, ::-1]
@@ -156,7 +162,14 @@ def main(argv=None):
 
                 timer = {'net': 0, 'restore': 0, 'nms': 0}
                 start = time.time()
-                score, geometry = sess.run([f_score, f_geometry], feed_dict={input_images: [im_resized]})
+                writer = tf.summary.FileWriter("/home/ubuntu/kalthoum/tensorboardlogs/EAST/ckpt/", sess.graph)
+                run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
+                run_metadata = tf.RunMetadata()
+                score, geometry = sess.run([f_score, f_geometry], feed_dict={input_images: [im_resized]}, options=run_options, run_metadata=run_metadata)
+                print('printing shapes')
+                print(score.shape)
+                print(geometry.shape)
+                writer.add_run_metadata(run_metadata, 'full run')
                 timer['net'] = time.time() - start
 
                 boxes, timer = detect(score_map=score, geo_map=geometry, timer=timer)
@@ -187,10 +200,56 @@ def main(argv=None):
                             f.write('{},{},{},{},{},{},{},{}\r\n'.format(
                                 box[0, 0], box[0, 1], box[1, 0], box[1, 1], box[2, 0], box[2, 1], box[3, 0], box[3, 1],
                             ))
+
                             cv2.polylines(im[:, :, ::-1], [box.astype(np.int32).reshape((-1, 1, 2))], True, color=(255, 255, 0), thickness=1)
                 if not FLAGS.no_write_images:
                     img_path = os.path.join(FLAGS.output_dir, os.path.basename(im_fn))
                     cv2.imwrite(img_path, im[:, :, ::-1])
+
+        print('\n == running from restored model == \n')
+        # Restore
+        with tf.Session(graph=tf.Graph()) as sess:
+            tf.saved_model.loader.load(sess, [tag_constants.SERVING], 'export/')
+            im_fn_list = get_images()
+            for im_fn in im_fn_list:
+                im = cv2.imread(im_fn)[:, :, ::-1]
+                im_resized, (ratio_h, ratio_w) = resize_image(im)
+                writer = tf.summary.FileWriter("/home/ubuntu/kalthoum/tensorboardlogs/EAST/save", sess.graph)
+                run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
+                run_metadata = tf.RunMetadata()
+                score, geometry = sess.run(['feature_fusion/Conv_7/Sigmoid:0', 'feature_fusion/concat_3:0'], feed_dict={'input_images:0': [im_resized]}, options=run_options, run_metadata=run_metadata)
+                print(score.shape)
+                print(geometry.shape)
+                writer.add_run_metadata(run_metadata, 'full run')
+                boxes, timer = detect(score_map=score, geo_map=geometry, timer=timer)
+
+                if boxes is not None:
+                    boxes = boxes[:, :8].reshape((-1, 4, 2))
+                    boxes[:, :, 0] /= ratio_w
+                    boxes[:, :, 1] /= ratio_h
+
+                # save to file
+                if boxes is not None:
+                    res_file = os.path.join(
+                        FLAGS.output_dir,
+                        '{}_saved.txt'.format(
+                            os.path.basename(im_fn).split('.')[0]))
+
+                    with open(res_file, 'w') as f:
+                        for box in boxes:
+                            # to avoid submitting errors
+                            box = sort_poly(box.astype(np.int32))
+                            if np.linalg.norm(box[0] - box[1]) < 5 or np.linalg.norm(box[3]-box[0]) < 5:
+                                continue
+                            f.write('{},{},{},{},{},{},{},{}\r\n'.format(
+                                box[0, 0], box[0, 1], box[1, 0], box[1, 1], box[2, 0], box[2, 1], box[3, 0], box[3, 1],
+                            ))
+                            cv2.polylines(im[:, :, ::-1], [box.astype(np.int32).reshape((-1, 1, 2))], True, color=(255, 255, 0), thickness=1)
+                if not FLAGS.no_write_images:
+                    img_path = os.path.join(FLAGS.output_dir, os.path.basename(im_fn))
+                    cv2.imwrite(img_path, im[:, :, ::-1])
+
+            exit(1)
 
 if __name__ == '__main__':
     tf.app.run()
